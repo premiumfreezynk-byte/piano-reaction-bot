@@ -2,28 +2,70 @@ package com.reactionbot
 
 import android.app.Activity
 import android.content.Intent
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 
+/**
+ * MainActivity — handles all permission grants in order:
+ *  1. SYSTEM_ALERT_WINDOW  (overlay)
+ *  2. MediaProjection       (screen capture pop-up → "Start now")
+ *  3. Accessibility hint    (user must enable manually in Settings)
+ *
+ * Uses ActivityResultLauncher (modern API) — no deprecated onActivityResult.
+ */
 class MainActivity : AppCompatActivity() {
 
-    companion object {
-        private const val REQ_OVERLAY = 100
-        private const val REQ_PROJECTION = 101
-    }
-
     private lateinit var statusText: TextView
+    private lateinit var btnLaunch: Button
+    private lateinit var mpManager: MediaProjectionManager
+
+    // ── Launchers ──────────────────────────────────────────────────────────────
+
+    private val overlayLauncher: ActivityResultLauncher<Intent> =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            if (Settings.canDrawOverlays(this)) {
+                requestScreenCapture()
+            } else {
+                showToast("Overlay permission denied. Tap LAUNCH again.")
+            }
+        }
+
+    private val projectionLauncher: ActivityResultLauncher<Intent> =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+                // Save for OverlayService to use when START is tapped
+                OverlayService.projectionResultCode = result.resultCode
+                OverlayService.projectionData     = result.data
+
+                // Start the floating overlay
+                ContextCompat.startForegroundService(
+                    this, Intent(this, OverlayService::class.java)
+                )
+                showToast("Overlay started! Tap ▶ START when ready.")
+                finish()
+            } else {
+                showToast("Screen capture denied — tap LAUNCH and choose \"Start now\".")
+            }
+        }
+
+    // ── Lifecycle ──────────────────────────────────────────────────────────────
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        mpManager  = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         statusText = findViewById(R.id.statusText)
-        findViewById<Button>(R.id.btnLaunch).setOnClickListener { checkPermissions() }
+        btnLaunch  = findViewById(R.id.btnLaunch)
+        btnLaunch.setOnClickListener { startPermissionFlow() }
     }
 
     override fun onResume() {
@@ -31,32 +73,59 @@ class MainActivity : AppCompatActivity() {
         updateStatus()
     }
 
-    private fun updateStatus() {
-        val overlayOk = Settings.canDrawOverlays(this)
-        val accessOk = isAccessibilityEnabled()
-        statusText.text = buildString {
-            appendLine("① Overlay permission:      ${if (overlayOk) "✓ Granted" else "✗ Not granted"}")
-            appendLine("② Screen capture:          ${if (OverlayService.projectionResultCode != -1) "✓ Ready" else "✗ Not granted yet"}")
-            appendLine("③ Accessibility service:   ${if (accessOk) "✓ Enabled" else "✗ Not enabled"}")
-            if (!overlayOk) appendLine("\n→ Tap LAUNCH to grant overlay permission.")
-            if (!accessOk) appendLine("\n→ Go to Settings › Accessibility › Installed Apps\n   › Reaction Bot › Enable")
-        }
-    }
+    // ── Permission flow ────────────────────────────────────────────────────────
 
-    private fun checkPermissions() {
+    private fun startPermissionFlow() {
         if (!Settings.canDrawOverlays(this)) {
-            startActivityForResult(
-                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")),
-                REQ_OVERLAY
+            showToast("Step 1/3 — Allow overlay permission")
+            overlayLauncher.launch(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName"))
             )
-            return
+        } else {
+            requestScreenCapture()
         }
-        requestProjection()
     }
 
-    private fun requestProjection() {
-        val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as android.media.projection.MediaProjectionManager
-        startActivityForResult(mgr.createScreenCaptureIntent(), REQ_PROJECTION)
+    private fun requestScreenCapture() {
+        showToast("Step 2/3 — Tap \"Start now\" in the next dialog")
+        projectionLauncher.launch(mpManager.createScreenCaptureIntent())
+    }
+
+    // ── Status display ─────────────────────────────────────────────────────────
+
+    private fun updateStatus() {
+        val overlayOk  = Settings.canDrawOverlays(this)
+        val captureOk  = OverlayService.projectionResultCode != -1
+        val accessOk   = isAccessibilityEnabled()
+
+        statusText.text = buildString {
+            appendLine("Step 1 — Overlay permission")
+            appendLine(if (overlayOk)  "  ✅ Granted" else "  ❌ Not granted yet")
+            appendLine()
+            appendLine("Step 2 — Screen capture")
+            appendLine(if (captureOk)  "  ✅ Ready"   else "  ❌ Not granted yet")
+            appendLine()
+            appendLine("Step 3 — Accessibility service")
+            appendLine(if (accessOk)   "  ✅ Enabled" else "  ❌ Not enabled")
+            if (!accessOk) {
+                appendLine()
+                appendLine("  → Settings › Accessibility › Installed Apps")
+                appendLine("    › Reaction Bot › toggle ON")
+            }
+            appendLine()
+            if (overlayOk && captureOk && accessOk) {
+                appendLine("🟢 ALL READY — tap ▶ START on the overlay!")
+            } else {
+                appendLine("👆 Tap LAUNCH BOT to complete setup.")
+            }
+        }
+
+        btnLaunch.text = when {
+            !overlayOk  -> "LAUNCH BOT  (grant overlay)"
+            !captureOk  -> "LAUNCH BOT  (grant screen capture)"
+            else        -> "RELAUNCH OVERLAY"
+        }
     }
 
     private fun isAccessibilityEnabled(): Boolean {
@@ -69,26 +138,6 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) { false }
     }
 
-    @Suppress("DEPRECATION")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        when (requestCode) {
-            REQ_OVERLAY -> {
-                if (Settings.canDrawOverlays(this)) requestProjection()
-                else Toast.makeText(this, "Overlay permission is required.", Toast.LENGTH_LONG).show()
-            }
-            REQ_PROJECTION -> {
-                if (resultCode == Activity.RESULT_OK && data != null) {
-                    // Store in OverlayService companion — shared across app lifetime
-                    OverlayService.projectionResultCode = resultCode
-                    OverlayService.projectionData = data
-                    startForegroundService(Intent(this, OverlayService::class.java))
-                    Toast.makeText(this, "Bot overlay launched! Tap START to begin.", Toast.LENGTH_LONG).show()
-                    finish()
-                } else {
-                    Toast.makeText(this, "Screen capture permission denied.", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-    }
+    private fun showToast(msg: String) =
+        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
 }
