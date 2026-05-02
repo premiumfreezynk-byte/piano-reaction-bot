@@ -10,155 +10,190 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.IBinder
+import android.provider.Settings
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 
 /**
- * Persistent floating "Command Center" overlay.
- * Draws over other apps using TYPE_APPLICATION_OVERLAY.
- * Provides START / STOP / CALIBRATE buttons and 4 draggable sensor points.
+ * Floating Command Center overlay.
+ * ▶ START  — checks accessibility + capture ready before starting.
+ * ■ STOP   — stops capture, bot disarmed.
+ * ⊕ CAL   — toggles 4 draggable sensor dots.
  */
 class OverlayService : Service() {
 
-    private lateinit var windowManager: WindowManager
-    private var controlPanel: View? = null
-    private val sensorViews = ArrayList<View>(4)
+    private lateinit var wm: WindowManager
+    private var panel: View? = null
+    private val dots = ArrayList<View>(4)
 
     companion object {
-        const val CHANNEL_ID = "overlay_channel"
-        var projectionResultCode: Int = -1
-        var projectionData: Intent? = null
+        const val CHANNEL_ID = "overlay_ch"
+        @Volatile var projectionResultCode: Int   = -1
+        @Volatile var projectionData: Intent?     = null
     }
+
+    // ── Lifecycle ──────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        createNotificationChannel()
-        startForeground(1, buildNotification())
-        showControlPanel()
+        wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        createChannel()
+        startForeground(1, buildNote())
+        buildPanel()
     }
 
-    // ── Control panel ──────────────────────────────────────────────────────────
+    override fun onDestroy() {
+        removePanel()
+        clearDots()
+        super.onDestroy()
+    }
 
-    private fun showControlPanel() {
-        val panel = LinearLayout(this).apply {
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    // ── Panel ──────────────────────────────────────────────────────────────────
+
+    private fun buildPanel() {
+        val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(14, 10, 14, 10)
-            setBackgroundColor(Color.argb(230, 15, 15, 15))
+            setPadding(16, 10, 16, 10)
+            setBackgroundColor(Color.argb(235, 10, 10, 10))
         }
 
-        panel.addView(makeBtn("▶ START", Color.rgb(0, 160, 60)) {
-            if (projectionResultCode == -1 || projectionData == null) {
-                toast("Restart app to grant screen permission first.")
-                return@makeBtn
-            }
-            BotState.isRunning = true
-            startCapture()
-            toast("Bot running!")
-        })
-        panel.addView(makeBtn("■ STOP", Color.rgb(190, 20, 20)) {
-            BotState.isRunning = false
-            stopService(Intent(this, ScreenCaptureService::class.java))
-            toast("Bot stopped")
-        })
-        panel.addView(makeBtn("⊕ CAL", Color.rgb(10, 80, 180)) {
-            toggleCalibrate()
-        })
+        val btnStart = chip("▶ START", Color.rgb(0, 170, 60)) { onStart() }
+        val btnStop  = chip("■ STOP",  Color.rgb(200, 20, 20))  { onStop() }
+        val btnCal   = chip("⊕ CAL",  Color.rgb(20, 80, 200))  { onCal() }
 
-        val lp = overlayParams(
+        row.addView(btnStart)
+        row.addView(btnStop)
+        row.addView(btnCal)
+
+        val lp = wlp(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT
-        ).apply { gravity = Gravity.TOP or Gravity.START; x = 10; y = 80 }
+        ).apply { gravity = Gravity.TOP or Gravity.START; x = 12; y = 80 }
 
-        windowManager.addView(panel, lp)
-        controlPanel = panel
-        makePanelDraggable(panel, lp)
+        wm.addView(row, lp)
+        panel = row
+        draggable(row, lp)
     }
 
-    private fun makeBtn(label: String, bg: Int, onClick: () -> Unit): Button =
-        Button(this).apply {
+    private fun chip(label: String, bg: Int, click: () -> Unit): TextView =
+        TextView(this).apply {
             text = label
-            setBackgroundColor(bg)
             setTextColor(Color.WHITE)
-            textSize = 11f
-            setPadding(18, 6, 18, 6)
+            textSize = 13f
+            setBackgroundColor(bg)
+            setPadding(20, 10, 20, 10)
+            setOnClickListener { click() }
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { marginEnd = 6 }
-            setOnClickListener { onClick() }
         }
 
-    // ── Calibration sensor points ──────────────────────────────────────────────
+    // ── Button actions ─────────────────────────────────────────────────────────
 
-    private fun toggleCalibrate() {
-        if (sensorViews.isEmpty()) showSensorPoints() else hideSensorPoints()
+    private fun onStart() {
+        // Guard 1: screen capture permission
+        if (projectionResultCode == -1 || projectionData == null) {
+            toast("❌ No screen capture permission.\nOpen the app and tap LAUNCH BOT first.")
+            return
+        }
+        // Guard 2: accessibility service must be active
+        if (BotState.accessibilityService == null) {
+            toast("❌ Accessibility service not active.\nSettings › Accessibility › Reaction Bot › Enable")
+            return
+        }
+        // All good — start
+        BotState.isRunning = true
+        startForegroundService(
+            Intent(this, ScreenCaptureService::class.java).apply {
+                putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, projectionResultCode)
+                putExtra(ScreenCaptureService.EXTRA_DATA, projectionData)
+            }
+        )
+        toast("✅ Bot started! Tapping dark tiles…")
     }
 
-    private fun showSensorPoints() {
+    private fun onStop() {
+        BotState.isRunning = false
+        stopService(Intent(this, ScreenCaptureService::class.java))
+        toast("⏹ Bot stopped.")
+    }
+
+    private fun onCal() {
+        if (dots.isEmpty()) {
+            addDots()
+            toast("Drag orange dots onto each lane, then tap ⊕ CAL again to save.")
+        } else {
+            clearDots()
+            toast("✅ Sensor positions saved.")
+        }
+    }
+
+    // ── Calibration dots ───────────────────────────────────────────────────────
+
+    private fun addDots() {
         for (i in 0..3) {
             val dot = View(this).apply {
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
-                    setColor(Color.argb(200, 255, 80, 0))
+                    setColor(Color.argb(210, 255, 80, 0))
                     setStroke(4, Color.WHITE)
                 }
             }
-            val size = 64
+            val sz = 66
             val pt = BotState.sensorPoints[i]
-            val lp = overlayParams(size, size).apply {
+            val lp = wlp(sz, sz).apply {
                 gravity = Gravity.TOP or Gravity.START
-                x = pt.x.toInt() - size / 2
-                y = pt.y.toInt() - size / 2
+                x = pt.x.toInt() - sz / 2
+                y = pt.y.toInt() - sz / 2
             }
-            windowManager.addView(dot, lp)
-            sensorViews.add(dot)
-            makeSensorDraggable(dot, lp, i)
+            wm.addView(dot, lp)
+            dots.add(dot)
+            draggableDot(dot, lp, i)
         }
-        toast("Drag orange dots to align with lanes, then tap CAL again")
     }
 
-    private fun hideSensorPoints() {
-        sensorViews.forEach { try { windowManager.removeView(it) } catch (_: Exception) {} }
-        sensorViews.clear()
-        toast("Sensor positions saved")
+    private fun clearDots() {
+        dots.forEach { try { wm.removeView(it) } catch (_: Exception) {} }
+        dots.clear()
     }
 
     // ── Drag helpers ───────────────────────────────────────────────────────────
 
-    private fun makePanelDraggable(view: View, lp: WindowManager.LayoutParams) {
-        var dx = 0; var dy = 0; var tx = 0f; var ty = 0f
-        view.setOnTouchListener { _, e ->
+    private fun draggable(v: View, lp: WindowManager.LayoutParams) {
+        var ox = 0; var oy = 0; var tx = 0f; var ty = 0f
+        v.setOnTouchListener { _, e ->
             when (e.action) {
-                MotionEvent.ACTION_DOWN -> { dx = lp.x; dy = lp.y; tx = e.rawX; ty = e.rawY }
+                MotionEvent.ACTION_DOWN -> { ox = lp.x; oy = lp.y; tx = e.rawX; ty = e.rawY }
                 MotionEvent.ACTION_MOVE -> {
-                    lp.x = dx + (e.rawX - tx).toInt()
-                    lp.y = dy + (e.rawY - ty).toInt()
-                    windowManager.updateViewLayout(view, lp)
+                    lp.x = ox + (e.rawX - tx).toInt()
+                    lp.y = oy + (e.rawY - ty).toInt()
+                    wm.updateViewLayout(v, lp)
                 }
             }
             false
         }
     }
 
-    private fun makeSensorDraggable(view: View, lp: WindowManager.LayoutParams, idx: Int) {
-        var dx = 0; var dy = 0; var tx = 0f; var ty = 0f
-        view.setOnTouchListener { _, e ->
+    private fun draggableDot(v: View, lp: WindowManager.LayoutParams, idx: Int) {
+        var ox = 0; var oy = 0; var tx = 0f; var ty = 0f
+        v.setOnTouchListener { _, e ->
             when (e.action) {
-                MotionEvent.ACTION_DOWN -> { dx = lp.x; dy = lp.y; tx = e.rawX; ty = e.rawY }
+                MotionEvent.ACTION_DOWN -> { ox = lp.x; oy = lp.y; tx = e.rawX; ty = e.rawY }
                 MotionEvent.ACTION_MOVE -> {
-                    lp.x = dx + (e.rawX - tx).toInt()
-                    lp.y = dy + (e.rawY - ty).toInt()
-                    windowManager.updateViewLayout(view, lp)
-                    // Update shared state so ScreenCaptureService reads new coords
+                    lp.x = ox + (e.rawX - tx).toInt()
+                    lp.y = oy + (e.rawY - ty).toInt()
+                    wm.updateViewLayout(v, lp)
                     BotState.sensorPoints[idx].set(
-                        (lp.x + 32).toFloat(),
-                        (lp.y + 32).toFloat()
+                        (lp.x + 33).toFloat(),
+                        (lp.y + 33).toFloat()
                     )
                 }
             }
@@ -166,45 +201,30 @@ class OverlayService : Service() {
         }
     }
 
-    // ── Screen capture ─────────────────────────────────────────────────────────
+    // ── Helpers ────────────────────────────────────────────────────────────────
 
-    private fun startCapture() {
-        val intent = Intent(this, ScreenCaptureService::class.java).apply {
-            putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, projectionResultCode)
-            putExtra(ScreenCaptureService.EXTRA_PROJECTION_DATA, projectionData)
-        }
-        startForegroundService(intent)
-    }
-
-    // ── Overlay params helper ──────────────────────────────────────────────────
-
-    private fun overlayParams(w: Int, h: Int) = WindowManager.LayoutParams(
+    private fun wlp(w: Int, h: Int) = WindowManager.LayoutParams(
         w, h,
         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
         PixelFormat.TRANSLUCENT
     )
 
-    // ── Notification ───────────────────────────────────────────────────────────
+    private fun removePanel() {
+        try { panel?.let { wm.removeView(it) } } catch (_: Exception) {}
+    }
 
-    private fun buildNotification() = Notification.Builder(this, CHANNEL_ID)
-        .setContentTitle("Reaction Bot Active")
-        .setContentText("Floating overlay running")
+    private fun toast(msg: String) =
+        Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show()
+
+    private fun buildNote() = Notification.Builder(this, CHANNEL_ID)
+        .setContentTitle("Reaction Bot — Overlay Active")
+        .setContentText("Tap ▶ START on the floating panel")
         .setSmallIcon(android.R.drawable.ic_menu_view)
         .build()
 
-    private fun createNotificationChannel() {
-        val ch = NotificationChannel(CHANNEL_ID, "Overlay Service", NotificationManager.IMPORTANCE_LOW)
+    private fun createChannel() {
+        val ch = NotificationChannel(CHANNEL_ID, "Overlay", NotificationManager.IMPORTANCE_LOW)
         (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
     }
-
-    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-
-    override fun onDestroy() {
-        try { controlPanel?.let { windowManager.removeView(it) } } catch (_: Exception) {}
-        hideSensorPoints()
-        super.onDestroy()
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
 }
